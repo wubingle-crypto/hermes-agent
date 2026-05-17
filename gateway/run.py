@@ -6666,6 +6666,9 @@ class GatewayRunner:
         if canonical == "model":
             return await self._handle_model_command(event)
 
+        if canonical == "provider":
+            return await self._handle_provider_command(event)
+
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
@@ -9570,6 +9573,190 @@ class GatewayRunner:
             lines.append(t("gateway.model.saved_global"))
         else:
             lines.append(t("gateway.model.session_only_hint"))
+
+        return "\n".join(lines)
+
+    async def _handle_provider_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /provider command — switch provider only (keep current model).
+
+        Supports:
+          /provider                    — show current provider + available list
+          /provider <name>             — switch provider, keep model
+          /provider <name> --global    — persist to config.yaml
+        """
+        from hermes_cli.model_switch import (
+            switch_model as _switch_model,
+            parse_model_flags,
+            list_authenticated_providers,
+        )
+        from hermes_cli.providers import get_label, resolve_provider_full
+
+        raw_args = event.get_command_args().strip()
+
+        # Parse --global flag
+        persist_global = "--global" in raw_args
+        if persist_global:
+            raw_args = raw_args.replace("--global", "").strip()
+
+        argv = raw_args.split()
+        provider_slug = argv[0] if argv else ""
+
+        # Read current config
+        current_model = ""
+        current_provider = ""
+        current_base_url = ""
+        current_api_key = ""
+        user_provs = None
+        custom_provs = None
+        try:
+            cfg = _load_gateway_config()
+            if cfg:
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, dict):
+                    current_model = model_cfg.get("default", "")
+                    current_provider = model_cfg.get("provider", "")
+                    current_base_url = model_cfg.get("base_url", "")
+                user_provs = cfg.get("providers")
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers
+                    custom_provs = get_compatible_custom_providers(cfg)
+                except Exception:
+                    custom_provs = cfg.get("custom_providers")
+        except Exception:
+            pass
+
+        # Check for session override
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        override = self._session_model_overrides.get(session_key, {})
+        if override:
+            current_model = override.get("model", current_model)
+            current_provider = override.get("provider", current_provider)
+            current_base_url = override.get("base_url", current_base_url)
+            current_api_key = override.get("api_key", current_api_key)
+
+        # No args: show current provider + available list
+        if not provider_slug:
+            provider_label = get_label(current_provider) if current_provider else "unknown"
+            lines = [
+                f"Current provider: **{provider_label}**",
+                f"Current model: `{current_model or 'unknown'}`",
+                "",
+                f"/provider `<slug>` — switch provider (keep model)",
+                f"/provider `<slug>` --global — persist to config.yaml",
+                "",
+                "Available providers:",
+            ]
+            try:
+                pvds = list_authenticated_providers(
+                    current_provider=current_provider,
+                    current_base_url=current_base_url,
+                    current_model=current_model,
+                    user_providers=user_provs,
+                    custom_providers=custom_provs,
+                    max_models=3,
+                )
+                for p in pvds:
+                    tag = " ◀ current" if p.get("is_current") else ""
+                    lines.append(f"- **{p['name']}** (`{p['slug']}`){tag}")
+            except Exception:
+                lines.append("  (failed to enumerate)")
+            return "\n".join(lines)
+
+        # Perform the switch: reuse switch_model with current model + explicit provider
+        result = _switch_model(
+            raw_input=current_model or "",
+            current_provider=current_provider,
+            current_model=current_model or "",
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+            is_global=persist_global,
+            explicit_provider=provider_slug,
+            user_providers=user_provs,
+            custom_providers=custom_provs,
+        )
+
+        if not result.success:
+            return f"✗ {result.error_message}"
+
+        # Update cached agent in-place
+        cached_entry = None
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock and _cache is not None:
+            with _cache_lock:
+                cached_entry = _cache.get(session_key)
+        if cached_entry and cached_entry[0] is not None:
+            try:
+                cached_entry[0].switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                )
+            except Exception as exc:
+                logger.warning("Provider switch failed for cached agent: %s", exc)
+
+        # Store model note + session override
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        self._pending_model_notes[session_key] = (
+            f"[Note: model was just switched from {current_model} to {result.new_model} "
+            f"via {result.provider_label or result.target_provider}. "
+            f"Adjust your self-identification accordingly.]"
+        )
+        self._session_model_overrides[session_key] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+
+        # Evict cached agent so next turn creates fresh agent from override
+        self._evict_cached_agent(session_key)
+
+        # Build confirmation
+        old_label = get_label(current_provider) if current_provider else "unknown"
+        new_label = result.provider_label or result.target_provider
+        lines = [f"✓ Provider switched: **{old_label}** → **{new_label}**"]
+        lines.append(f"  Model: `{result.new_model}` (unchanged)")
+
+        mi = result.model_info
+        from hermes_cli.model_switch import resolve_display_context_length
+        _sw2_config_ctx = None
+        try:
+            _sw2_cfg = _load_gateway_config()
+            _sw2_model_cfg = _sw2_cfg.get("model", {})
+            if isinstance(_sw2_model_cfg, dict):
+                _sw2_raw = _sw2_model_cfg.get("context_length")
+                if _sw2_raw is not None:
+                    _sw2_config_ctx = int(_sw2_raw)
+        except Exception:
+            pass
+        ctx = resolve_display_context_length(
+            result.new_model,
+            result.target_provider,
+            base_url=result.base_url or current_base_url or "",
+            api_key=result.api_key or current_api_key or "",
+            model_info=mi,
+            custom_providers=custom_provs,
+            config_context_length=_sw2_config_ctx,
+        )
+        if ctx:
+            lines.append(f"  Context: {ctx:,} tokens")
+        if mi:
+            if mi.max_output:
+                lines.append(f"  Max output: {mi.max_output:,} tokens")
+            if mi.has_cost_data():
+                lines.append(f"  Cost: {mi.format_cost()}")
+        if persist_global:
+            lines.append("Saved to config.yaml (--global)")
+        else:
+            lines.append("(session only — add --global to persist)")
+        if result.warning_message:
+            lines.append(f"⚠ {result.warning_message}")
 
         return "\n".join(lines)
 

@@ -7141,6 +7141,146 @@ class HermesCLI:
         else:
             _cprint("    (session only — add --global to persist)")
 
+    def _handle_provider_switch(self, cmd_original: str):
+        """Handle /provider command — switch provider only (keep current model).
+
+        Supports:
+          /provider                           — show current provider + available list
+          /provider <name>                    — switch provider, keep model
+          /provider <name> --global           — persist to config.yaml
+        """
+        from hermes_cli.model_switch import (
+            switch_model as _switch_model,
+            list_authenticated_providers,
+        )
+        from hermes_cli.providers import get_label, resolve_provider_full
+
+        parts = cmd_original.split(None, 1)
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+
+        # Parse --global flag
+        import re as _re
+        raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015]global', '--global', raw_args)
+        persist_global = "--global" in raw_args
+        if persist_global:
+            raw_args = raw_args.replace("--global", "").strip()
+
+        argv = raw_args.split()
+        provider_slug = argv[0] if argv else ""
+
+        # Load provider context
+        from hermes_cli.inventory import load_picker_context
+        ctx = load_picker_context().with_overrides(
+            current_provider=self.provider or "",
+            current_model=self.model or "",
+            current_base_url=self.base_url or "",
+        )
+
+        # No args: show current + list
+        if not provider_slug:
+            model_display = self.model or "unknown"
+            provider_display = get_label(self.provider) if self.provider else "unknown"
+            _cprint(f"  Current model: {model_display}")
+            _cprint(f"  Current provider: {provider_display}")
+            _cprint("")
+            _cprint("  /provider <slug>              switch provider")
+            _cprint("  /provider <slug> --global     persist to config.yaml")
+            _cprint("")
+            _cprint("  Available providers:")
+            try:
+                pvds = list_authenticated_providers(
+                    current_provider=self.provider or "",
+                    current_base_url=self.base_url or "",
+                    current_model=self.model or "",
+                    user_providers=ctx.user_providers,
+                    custom_providers=ctx.custom_providers,
+                    max_models=3,
+                )
+                for p in pvds:
+                    tag = " ◀ current" if p["is_current"] else ""
+                    _cprint(f"    {p['name']} ({p['slug']}){tag}")
+            except Exception:
+                _cprint("    (failed to enumerate)")
+            return
+
+        # Resolve provider slug
+        pdef = resolve_provider_full(
+            provider_slug,
+            ctx.user_providers,
+            ctx.custom_providers,
+        )
+        if pdef is None:
+            _cprint(f"  ✗ Unknown provider '{provider_slug}'")
+            _cprint("  Run /provider with no arguments to see available providers.")
+            return
+
+        # Use switch_model with current model + explicit provider
+        current_model = self.model or ""
+        result = _switch_model(
+            raw_input=current_model,
+            current_provider=self.provider or "",
+            current_model=current_model,
+            current_base_url=self.base_url or "",
+            current_api_key=self.api_key or "",
+            is_global=persist_global,
+            explicit_provider=provider_slug,
+            user_providers=ctx.user_providers,
+            custom_providers=ctx.custom_providers,
+        )
+
+        if not result.success:
+            _cprint(f"  ✗ {result.error_message}")
+            return
+
+        # Apply to CLI state
+        old_provider = self.provider or ""
+        old_model = self.model
+        self.model = result.new_model
+        self.provider = result.target_provider
+        self.requested_provider = result.target_provider
+        self._explicit_api_key = result.api_key
+        self._explicit_base_url = result.base_url
+        if result.api_key:
+            self.api_key = result.api_key
+        if result.base_url:
+            self.base_url = result.base_url
+        if result.api_mode:
+            self.api_mode = result.api_mode
+
+        # Apply to running agent (in-place swap)
+        if self.agent is not None:
+            try:
+                self.agent.switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                )
+            except Exception as exc:
+                _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
+
+        # Store note for next turn
+        self._pending_model_switch_note = (
+            f"[Note: model was just switched from {old_model} to {result.new_model} "
+            f"via {result.provider_label or result.target_provider}. "
+            f"Adjust your self-identification accordingly.]"
+        )
+
+        # Display confirmation
+        provider_label = result.provider_label or result.target_provider
+        _cprint(f"  ✓ Provider switched: {old_provider} → {provider_label}")
+        _cprint(f"    Model: {result.new_model} (unchanged)")
+
+        # Persistence
+        if persist_global:
+            save_config_value("model.provider", result.target_provider)
+            if result.new_model and result.new_model != old_model:
+                save_config_value("model.default", result.new_model)
+            _cprint("    Saved to config.yaml (--global)")
+        else:
+            _cprint("    (session only — add --global to persist)")
+
     def _handle_codex_runtime(self, cmd_original: str) -> None:
         """Handle /codex-runtime — toggle the codex app-server runtime opt-in.
 
@@ -7873,6 +8013,8 @@ class HermesCLI:
             self._handle_sessions_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical == "provider":
+            self._handle_provider_switch(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
         elif canonical == "gquota":
