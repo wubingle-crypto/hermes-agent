@@ -3502,20 +3502,18 @@ class HermesCLI:
 
         try:
             from hermes_cli.model_normalize import (
-                _AGGREGATOR_PROVIDERS,
                 normalize_model_for_provider,
             )
 
-            if resolved_provider not in _AGGREGATOR_PROVIDERS:
-                normalized_model = normalize_model_for_provider(current_model, resolved_provider)
-                if normalized_model and normalized_model != current_model:
-                    if not self._model_is_default:
-                        self._console_print(
-                            f"[yellow]⚠️  Normalized model '{current_model}' to '{normalized_model}' for {resolved_provider}.[/]"
-                        )
-                    self.model = normalized_model
-                    current_model = normalized_model
-                    changed = True
+            normalized_model = normalize_model_for_provider(current_model, resolved_provider)
+            if normalized_model and normalized_model != current_model:
+                if not self._model_is_default:
+                    self._console_print(
+                        f"[yellow]⚠️  Normalized model '{current_model}' to '{normalized_model}' for {resolved_provider}.[/]"
+                    )
+                self.model = normalized_model
+                current_model = normalized_model
+                changed = True
         except Exception:
             pass
 
