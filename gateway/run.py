@@ -4763,11 +4763,106 @@ class GatewayRunner:
                             pass
             return False
 
+        # Auto-decompose: turn fresh triage tasks into ready workgraphs
+        # before the dispatcher fans out workers. Gated by
+        # ``kanban.auto_decompose`` (default True). Capped by
+        # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
+        # of triage tasks doesn't burst-spend the aux LLM in one tick;
+        # remainder defers to subsequent ticks.
+        auto_decompose_enabled = bool(kanban_cfg.get("auto_decompose", True))
+        try:
+            auto_decompose_per_tick = int(
+                kanban_cfg.get("auto_decompose_per_tick", 3) or 3
+            )
+        except (TypeError, ValueError):
+            auto_decompose_per_tick = 3
+        if auto_decompose_per_tick < 1:
+            auto_decompose_per_tick = 1
+
+        def _auto_decompose_tick() -> int:
+            """Run the auto-decomposer for up to N triage tasks across all
+            boards. Returns the number of triage tasks that were
+            successfully decomposed or specified this tick.
+            """
+            try:
+                from hermes_cli import kanban_decompose as _decomp
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "kanban auto-decompose: import failed (%s); skipping", exc,
+                )
+                return 0
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            attempted = 0
+            successes = 0
+            for b in boards:
+                slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if attempted >= auto_decompose_per_tick:
+                    break
+                # Pin this board for the duration of the call — same
+                # pattern as the dashboard specify endpoint. The
+                # decomposer module connects with no board kwarg and
+                # relies on the env var.
+                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+                try:
+                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                    try:
+                        triage_ids = _decomp.list_triage_ids()
+                    except Exception as exc:
+                        logger.debug(
+                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
+                            slug, exc,
+                        )
+                        triage_ids = []
+                    for tid in triage_ids:
+                        if attempted >= auto_decompose_per_tick:
+                            break
+                        attempted += 1
+                        try:
+                            outcome = _decomp.decompose_task(
+                                tid, author="auto-decomposer",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "kanban auto-decompose: decompose_task crashed on %s",
+                                tid,
+                            )
+                            continue
+                        if outcome.ok:
+                            successes += 1
+                            if outcome.fanout and outcome.child_ids:
+                                logger.info(
+                                    "kanban auto-decompose [%s]: %s → %d children",
+                                    slug, tid, len(outcome.child_ids),
+                                )
+                            else:
+                                logger.info(
+                                    "kanban auto-decompose [%s]: %s → single task (no fanout)",
+                                    slug, tid,
+                                )
+                        else:
+                            # Common no-op reasons (no aux client configured) shouldn't
+                            # spam logs every tick. Log at debug.
+                            logger.debug(
+                                "kanban auto-decompose [%s]: %s skipped: %s",
+                                slug, tid, outcome.reason,
+                            )
+                finally:
+                    if prev_env is None:
+                        os.environ.pop("HERMES_KANBAN_BOARD", None)
+                    else:
+                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
+            return successes
+
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
         while self._running:
             try:
+                if auto_decompose_enabled:
+                    await asyncio.to_thread(_auto_decompose_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
@@ -6570,6 +6665,9 @@ class GatewayRunner:
 
         if canonical == "model":
             return await self._handle_model_command(event)
+
+        if canonical == "provider":
+            return await self._handle_provider_command(event)
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
@@ -8863,7 +8961,7 @@ class GatewayRunner:
                 lines.append("Failed/paused: (none)")
             return "\n".join(lines)
 
-        if action in ("pause", "resume"):
+        if action in {"pause", "resume"}:
             if not target:
                 return f"Usage: /platform {action} <name>"
             platform = _resolve_platform(target)
@@ -8971,13 +9069,15 @@ class GatewayRunner:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
         active_agents = self._running_agent_count()
-        # When running under a service manager (systemd/launchd), use the
-        # service restart path: exit with code 75 so the service manager
-        # restarts us.  The detached subprocess approach (setsid + bash)
-        # doesn't work under systemd because KillMode=mixed kills all
-        # processes in the cgroup, including the detached helper.
+        # When running under a service manager (systemd/launchd) or inside a
+        # Docker/Podman container, use the service restart path: exit with
+        # code 75 so the service manager / container restart policy restarts
+        # us.  The detached subprocess approach (setsid + bash) doesn't work
+        # under systemd (KillMode=mixed kills the cgroup) or Docker (tini
+        # exits when the gateway dies, taking the detached helper with it).
         _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
-        if _under_service:
+        _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+        if _under_service or _in_container:
             self.request_restart(detached=False, via_service=True)
         else:
             self.request_restart(detached=True, via_service=False)
@@ -9473,6 +9573,190 @@ class GatewayRunner:
             lines.append(t("gateway.model.saved_global"))
         else:
             lines.append(t("gateway.model.session_only_hint"))
+
+        return "\n".join(lines)
+
+    async def _handle_provider_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /provider command — switch provider only (keep current model).
+
+        Supports:
+          /provider                    — show current provider + available list
+          /provider <name>             — switch provider, keep model
+          /provider <name> --global    — persist to config.yaml
+        """
+        from hermes_cli.model_switch import (
+            switch_model as _switch_model,
+            parse_model_flags,
+            list_authenticated_providers,
+        )
+        from hermes_cli.providers import get_label, resolve_provider_full
+
+        raw_args = event.get_command_args().strip()
+
+        # Parse --global flag
+        persist_global = "--global" in raw_args
+        if persist_global:
+            raw_args = raw_args.replace("--global", "").strip()
+
+        argv = raw_args.split()
+        provider_slug = argv[0] if argv else ""
+
+        # Read current config
+        current_model = ""
+        current_provider = ""
+        current_base_url = ""
+        current_api_key = ""
+        user_provs = None
+        custom_provs = None
+        try:
+            cfg = _load_gateway_config()
+            if cfg:
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, dict):
+                    current_model = model_cfg.get("default", "")
+                    current_provider = model_cfg.get("provider", "")
+                    current_base_url = model_cfg.get("base_url", "")
+                user_provs = cfg.get("providers")
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers
+                    custom_provs = get_compatible_custom_providers(cfg)
+                except Exception:
+                    custom_provs = cfg.get("custom_providers")
+        except Exception:
+            pass
+
+        # Check for session override
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        override = self._session_model_overrides.get(session_key, {})
+        if override:
+            current_model = override.get("model", current_model)
+            current_provider = override.get("provider", current_provider)
+            current_base_url = override.get("base_url", current_base_url)
+            current_api_key = override.get("api_key", current_api_key)
+
+        # No args: show current provider + available list
+        if not provider_slug:
+            provider_label = get_label(current_provider) if current_provider else "unknown"
+            lines = [
+                f"Current provider: **{provider_label}**",
+                f"Current model: `{current_model or 'unknown'}`",
+                "",
+                f"/provider `<slug>` — switch provider (keep model)",
+                f"/provider `<slug>` --global — persist to config.yaml",
+                "",
+                "Available providers:",
+            ]
+            try:
+                pvds = list_authenticated_providers(
+                    current_provider=current_provider,
+                    current_base_url=current_base_url,
+                    current_model=current_model,
+                    user_providers=user_provs,
+                    custom_providers=custom_provs,
+                    max_models=3,
+                )
+                for p in pvds:
+                    tag = " ◀ current" if p.get("is_current") else ""
+                    lines.append(f"- **{p['name']}** (`{p['slug']}`){tag}")
+            except Exception:
+                lines.append("  (failed to enumerate)")
+            return "\n".join(lines)
+
+        # Perform the switch: reuse switch_model with current model + explicit provider
+        result = _switch_model(
+            raw_input=current_model or "",
+            current_provider=current_provider,
+            current_model=current_model or "",
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+            is_global=persist_global,
+            explicit_provider=provider_slug,
+            user_providers=user_provs,
+            custom_providers=custom_provs,
+        )
+
+        if not result.success:
+            return f"✗ {result.error_message}"
+
+        # Update cached agent in-place
+        cached_entry = None
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock and _cache is not None:
+            with _cache_lock:
+                cached_entry = _cache.get(session_key)
+        if cached_entry and cached_entry[0] is not None:
+            try:
+                cached_entry[0].switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                )
+            except Exception as exc:
+                logger.warning("Provider switch failed for cached agent: %s", exc)
+
+        # Store model note + session override
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        self._pending_model_notes[session_key] = (
+            f"[Note: model was just switched from {current_model} to {result.new_model} "
+            f"via {result.provider_label or result.target_provider}. "
+            f"Adjust your self-identification accordingly.]"
+        )
+        self._session_model_overrides[session_key] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+
+        # Evict cached agent so next turn creates fresh agent from override
+        self._evict_cached_agent(session_key)
+
+        # Build confirmation
+        old_label = get_label(current_provider) if current_provider else "unknown"
+        new_label = result.provider_label or result.target_provider
+        lines = [f"✓ Provider switched: **{old_label}** → **{new_label}**"]
+        lines.append(f"  Model: `{result.new_model}` (unchanged)")
+
+        mi = result.model_info
+        from hermes_cli.model_switch import resolve_display_context_length
+        _sw2_config_ctx = None
+        try:
+            _sw2_cfg = _load_gateway_config()
+            _sw2_model_cfg = _sw2_cfg.get("model", {})
+            if isinstance(_sw2_model_cfg, dict):
+                _sw2_raw = _sw2_model_cfg.get("context_length")
+                if _sw2_raw is not None:
+                    _sw2_config_ctx = int(_sw2_raw)
+        except Exception:
+            pass
+        ctx = resolve_display_context_length(
+            result.new_model,
+            result.target_provider,
+            base_url=result.base_url or current_base_url or "",
+            api_key=result.api_key or current_api_key or "",
+            model_info=mi,
+            custom_providers=custom_provs,
+            config_context_length=_sw2_config_ctx,
+        )
+        if ctx:
+            lines.append(f"  Context: {ctx:,} tokens")
+        if mi:
+            if mi.max_output:
+                lines.append(f"  Max output: {mi.max_output:,} tokens")
+            if mi.has_cost_data():
+                lines.append(f"  Cost: {mi.format_cost()}")
+        if persist_global:
+            lines.append("Saved to config.yaml (--global)")
+        else:
+            lines.append("(session only — add --global to persist)")
+        if result.warning_message:
+            lines.append(f"⚠ {result.warning_message}")
 
         return "\n".join(lines)
 
@@ -12546,6 +12830,12 @@ class GatewayRunner:
             and getattr(source, "chat_type", None) == "dm"
         ):
             metadata["telegram_dm_topic_reply_fallback"] = True
+            # Telegram DM topic lanes need direct_messages_topic_id in metadata
+            # so synthetic/queued messages (goal continuations, status notices)
+            # route to the correct topic even when reply anchor is unavailable.
+            tid = str(thread_id)
+            if tid and tid not in {"", "1"}:
+                metadata["direct_messages_topic_id"] = tid
             anchor = reply_to_message_id or getattr(source, "message_id", None)
             if anchor is not None:
                 metadata["telegram_reply_to_message_id"] = str(anchor)
@@ -12831,7 +13121,11 @@ class GatewayRunner:
                 update_cmd = (
                     f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
                     f" > {shlex.quote(str(output_path))} 2>&1; "
-                    f"status=$?; printf '%s' \"$status\" > {shlex.quote(str(exit_code_path))}"
+                    # Avoid `status=$?`: `status` is a read-only special parameter
+                    # in zsh, and this command string is copied/reused in macOS/zsh
+                    # operator wrappers. Keep the template zsh-safe even though this
+                    # specific subprocess currently runs under bash.
+                    f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}"
                 )
                 setsid_bin = shutil.which("setsid")
                 if setsid_bin:
